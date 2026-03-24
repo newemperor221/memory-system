@@ -129,6 +129,20 @@ impl ShortTermMemory {
         results
     }
 
+    /// 按 key 前缀过滤 entry
+    fn filter_by_agent_id(entries: Vec<Entry>, agent_id: Option<&str>) -> Vec<Entry> {
+        match agent_id {
+            Some(aid) => {
+                let prefix = format!("private:agent:{}:", aid);
+                entries
+                    .into_iter()
+                    .filter(|e| e.key.starts_with(&prefix))
+                    .collect()
+            }
+            None => entries,
+        }
+    }
+
     pub async fn recall(&self, req: &RecallRequest) -> Vec<RecallResult> {
         let mut results = Vec::new();
 
@@ -141,9 +155,10 @@ impl ShortTermMemory {
         }
 
         let all_entries = self.get_all_entries().await;
+        let filtered = Self::filter_by_agent_id(all_entries, req.agent_id.as_deref());
         let query_lower = req.query.to_lowercase();
 
-        for entry in all_entries {
+        for entry in filtered {
             if entry.value.to_lowercase().contains(&query_lower) {
                 if !results
                     .iter()

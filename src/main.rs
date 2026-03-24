@@ -48,12 +48,55 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// 合并两个 RecallResult 列表，按 entry.id 去重
+    fn merge_results(mut a: Vec<RecallResult>, mut b: Vec<RecallResult>) -> Vec<RecallResult> {
+        for item in b.drain(..) {
+            if !a.iter().any(|r| r.entry.id == item.entry.id) {
+                a.push(item);
+            }
+        }
+        a
+    }
+
+    /// 按 agent_id 过滤结果（key 前缀匹配）
+    fn filter_by_agent_id(results: Vec<RecallResult>, agent_id: Option<&str>) -> Vec<RecallResult> {
+        match agent_id {
+            Some(aid) => {
+                let prefix = format!("private:agent:{}:", aid);
+                results
+                    .into_iter()
+                    .filter(|r| r.entry.key.starts_with(&prefix))
+                    .collect()
+            }
+            None => results,
+        }
+    }
+
     pub async fn recall(&self, req: RecallRequest) -> Vec<RecallResult> {
-        self.l2.recall(&req, false).await
+        let agent_id = req.agent_id.as_deref();
+        // Bug fix: 同时搜索 L1 和 L2，再按 agent_id 过滤
+        let l2_results = self.l2.recall(&req, false).await;
+        let l1_results = self.l1.recall(&req).await;
+        let merged = Self::merge_results(l2_results, l1_results);
+        let sorted = {
+            let mut r = merged;
+            r.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            r
+        };
+        Self::filter_by_agent_id(sorted, agent_id)
     }
 
     pub async fn recall_with_semantic(&self, req: RecallRequest) -> Vec<RecallResult> {
-        self.l2.recall(&req, true).await
+        let agent_id = req.agent_id.as_deref();
+        let l2_results = self.l2.recall(&req, true).await;
+        let l1_results = self.l1.recall(&req).await;
+        let merged = Self::merge_results(l2_results, l1_results);
+        let sorted = {
+            let mut r = merged;
+            r.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            r
+        };
+        Self::filter_by_agent_id(sorted, agent_id)
     }
 
     pub async fn recall_bm25(&self, query: &str, limit: usize) -> Vec<RecallResult> {
@@ -337,7 +380,7 @@ async fn handle_connection(
     };
 
     let response = match (method.as_str(), path) {
-        // GET /recall?query=xxx&semantic=true&layer=public|private
+        // GET /recall?query=xxx&semantic=true&layer=public|private&agent_id=aicode
         ("GET", "/recall") => {
             let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
             let semantic = params.get("semantic").map_or(false, |v| v == "true");
@@ -346,10 +389,12 @@ async fn handle_connection(
                 "private" => Some(Layer::Private),
                 _ => None,
             });
+            // Bug fix: 解析 agent_id 参数并传递
+            let agent_id = params.get("agent_id").cloned();
             let results = if semantic {
-                bridge.recall_semantic(query, layer).await
+                bridge.recall_semantic_with_agent(query, layer, agent_id.as_deref()).await
             } else {
-                bridge.recall(query, layer).await
+                bridge.recall_with_agent(query, layer, agent_id.as_deref()).await
             };
             json_response(&results)
         }
@@ -415,14 +460,22 @@ async fn handle_connection(
                         "public" => Layer::Public,
                         _ => Layer::Private,
                     };
-                    bridge
-                        .remember_text(req.value, imp, req.tags.unwrap_or_default(), &req.agent_id, layer)
-                        .await?;
-                    json_response(&serde_json::json!({
-                        "ok": true,
-                        "layer": if layer == Layer::Public { "public" } else { "private" },
-                        "message": "记忆已保存"
-                    }))
+                    // [BugFix] only aiboss can write public layer
+                    if layer == Layer::Public && req.agent_id != "aiboss" {
+                        json_response(&serde_json::json!({
+                            "error": "forbidden",
+                            "detail": "only aiboss can write public memory"
+                        }))
+                    } else {
+                        bridge
+                            .remember_text(req.value, imp, req.tags.unwrap_or_default(), &req.agent_id, layer)
+                            .await?;
+                        json_response(&serde_json::json!({
+                            "ok": true,
+                            "layer": if layer == Layer::Public { "public" } else { "private" },
+                            "message": "记忆已保存"
+                        }))
+                    }
                 }
                 Err(e) => json_response(&serde_json::json!({
                     "error": "parse_error",

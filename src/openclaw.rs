@@ -237,10 +237,20 @@ impl OpenClawBridge {
 
     /// 召回 → 返回结果（搜指定 layer）
     pub async fn recall(&self, query: &str, layer: Option<Layer>) -> Vec<RecallResult> {
+        self.recall_with_agent(query, layer, None).await
+    }
+
+    /// 语义召回（搜指定 layer）
+    pub async fn recall_semantic(&self, query: &str, layer: Option<Layer>) -> Vec<RecallResult> {
+        self.recall_semantic_with_agent(query, layer, None).await
+    }
+
+    /// 带 agent_id 的召回（Bug fix: 传递 agent_id 到 MemorySystem）
+    pub async fn recall_with_agent(&self, query: &str, layer: Option<Layer>, agent_id: Option<&str>) -> Vec<RecallResult> {
         let req = RecallRequest {
             query: query.to_string(),
             keys: None,
-            agent_id: None,
+            agent_id: agent_id.map(String::from),
             tags: None,
             limit: Some(10),
             layer,
@@ -256,12 +266,12 @@ impl OpenClawBridge {
         }
     }
 
-    /// 语义召回（搜指定 layer）
-    pub async fn recall_semantic(&self, query: &str, layer: Option<Layer>) -> Vec<RecallResult> {
+    /// 带 agent_id 的语义召回
+    pub async fn recall_semantic_with_agent(&self, query: &str, layer: Option<Layer>, agent_id: Option<&str>) -> Vec<RecallResult> {
         let req = RecallRequest {
             query: query.to_string(),
             keys: None,
-            agent_id: None,
+            agent_id: agent_id.map(String::from),
             tags: None,
             limit: Some(10),
             layer,
