@@ -100,6 +100,7 @@ MEMORY_AGENT_ID=aicode ./memory-tool.py recall "搜索关键词" [条数] [publi
 | `MEMORY_BASE_URL` | `http://127.0.0.1:7890` | 服务地址 |
 | `MEMORY_WORKSPACE` | `.` | workspace 路径 |
 | `MEMORY_L1_PATH` | `/tmp/memory_l1` | **重要**：L1 数据库路径，必须设置 |
+| `GEMINI_EMBEDDINGS_TOKEN` | 空 | Gemini API Key（向量搜索用） |
 
 ---
 
@@ -114,10 +115,25 @@ mkdir -p "$WORKSPACE/.memory-l1"
 
 MEMORY_L1_PATH="$WORKSPACE/.memory-l1" \
 MEMORY_WORKSPACE="$WORKSPACE" \
+GEMINI_EMBEDDINGS_TOKEN=你的GEMINI密钥 \
 nohup "$DIR/../memory-system" serve \
     --workspace "$WORKSPACE" \
     --listen "$LISTEN" \
     </dev/null > "$LOG" 2>&1 &
+```
+
+### systemd 服务配置
+
+推荐使用 systemd 管理服务，在服务文件中配置环境变量：
+
+```ini
+[Service]
+ExecStart=/path/to/memory-system serve --workspace /path/to/workspace --listen 127.0.0.1:7890
+Restart=always
+RestartSec=5
+Environment=MEMORY_L1_PATH=/path/to/.memory-l1
+Environment=MEMORY_WORKSPACE=/path/to/workspace
+Environment=GEMINI_EMBEDDINGS_TOKEN=你的GEMINI密钥
 ```
 
 ### 向量搜索配置
@@ -125,6 +141,16 @@ nohup "$DIR/../memory-system" serve \
 向量搜索使用 Gemini Embeddings API，API Key 从环境变量 `GEMINI_EMBEDDINGS_TOKEN` 读取。
 
 服务地址：`127.0.0.1:7890`
+
+---
+
+## ⚠️ 安全注意
+
+**不要把 API 密钥提交到 GitHub！**
+
+- `.env` 文件不要上传
+- systemd 服务文件中的密钥不要上传
+- 使用 `.gitignore` 忽略敏感文件
 
 ---
 

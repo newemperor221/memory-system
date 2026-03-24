@@ -31,6 +31,13 @@ cargo build --release
 | `GEMINI_EMBEDDINGS_TOKEN` | Gemini API Key（用于向量搜索） |
 | `MEMORY_API_KEY` | API 密钥（可选） |
 
+## ⚠️ Security Warning
+
+**Never commit API keys to GitHub!**
+
+- Use environment variables or systemd service files for secrets
+- Add sensitive files to `.gitignore`
+
 ### 使用示例
 
 ```bash
