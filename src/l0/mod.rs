@@ -76,6 +76,13 @@ impl WorkingMemory {
             .unwrap_or_default()
     }
 
+    /// 删除指定 key
+    pub async fn remove(&self, key: &str) {
+        self.store.remove(key);
+        let mut keys = self.session_keys.write();
+        keys.remove(key);
+    }
+
     /// 关键词召回
     pub fn search(&self, keyword: &str) -> Vec<RecallResult> {
         let keyword_lower = keyword.to_lowercase();

@@ -48,6 +48,14 @@ impl MemorySystem {
         Ok(())
     }
 
+    /// 删除记忆（从所有层删除）
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.l0.remove(key).await;
+        self.l1.delete(key).await?;
+        self.l2.delete(key).await?;
+        Ok(())
+    }
+
     /// 合并两个 RecallResult 列表，按 entry.id 去重
     fn merge_results(mut a: Vec<RecallResult>, mut b: Vec<RecallResult>) -> Vec<RecallResult> {
         for item in b.drain(..) {
@@ -460,22 +468,16 @@ async fn handle_connection(
                         "public" => Layer::Public,
                         _ => Layer::Private,
                     };
-                    // [BugFix] only aiboss can write public layer
-                    if layer == Layer::Public && req.agent_id != "aiboss" {
-                        json_response(&serde_json::json!({
-                            "error": "forbidden",
-                            "detail": "only aiboss can write public memory"
-                        }))
-                    } else {
-                        bridge
-                            .remember_text(req.value, imp, req.tags.unwrap_or_default(), &req.agent_id, layer)
-                            .await?;
-                        json_response(&serde_json::json!({
-                            "ok": true,
-                            "layer": if layer == Layer::Public { "public" } else { "private" },
-                            "message": "记忆已保存"
-                        }))
-                    }
+                    // Reverted: all agents can write public memory
+                    // aiboss has delete permission for moderation
+                    bridge
+                        .remember_text(req.value, imp, req.tags.unwrap_or_default(), &req.agent_id, layer)
+                        .await?;
+                    json_response(&serde_json::json!({
+                        "ok": true,
+                        "layer": if layer == Layer::Public { "public" } else { "private" },
+                        "message": "记忆已保存"
+                    }))
                 }
                 Err(e) => json_response(&serde_json::json!({
                     "error": "parse_error",
@@ -496,6 +498,36 @@ async fn handle_connection(
                     "ok": true,
                     "message": "GC 完成"
                 }))
+            }
+        }
+
+        // DELETE /memory?key=xxx&agent_id=aiboss
+        ("DELETE", "/memory") => {
+            let key = params.get("key").cloned();
+            let agent_id = params.get("agent_id").cloned();
+
+            if key.is_none() {
+                json_response(&serde_json::json!({
+                    "error": "missing_param",
+                    "param": "key"
+                }))
+            } else if agent_id.as_deref() != Some("aiboss") {
+                // Only aiboss can delete public memories
+                json_response(&serde_json::json!({
+                    "error": "forbidden",
+                    "detail": "只有 aiboss 可以删除公共记忆"
+                }))
+            } else {
+                match bridge.delete(&key.unwrap()).await {
+                    Ok(_) => json_response(&serde_json::json!({
+                        "ok": true,
+                        "message": "记忆已删除"
+                    })),
+                    Err(e) => json_response(&serde_json::json!({
+                        "error": "delete_failed",
+                        "detail": e.to_string()
+                    })),
+                }
             }
         }
 

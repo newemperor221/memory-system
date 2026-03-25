@@ -199,6 +199,32 @@ impl LongTermMemory {
         self.maybe_evict().await;
     }
 
+    /// 删除指定 key（从 store、BM25、关键词索引、向量缓存中删除）
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        // 从 store 删除
+        {
+            let mut store = self.store.write().await;
+            store.remove(key);
+        }
+
+        // 从关键词索引删除
+        {
+            let mut index = self.keyword_index.write().await;
+            // 遍历所有倒排列表，移除包含此 key 的条目
+            for (_, keys) in index.iter_mut() {
+                keys.retain(|k| k != key);
+            }
+        }
+
+        // 从向量缓存删除
+        {
+            let mut vectors = self.vectors.write().await;
+            vectors.remove(key);
+        }
+
+        Ok(())
+    }
+
     /// 批量写入（迁移时使用，减少 await 开销）
     pub async fn write_batch(&self, entries: Vec<(String, Entry)>) {
         for (key, entry) in entries {

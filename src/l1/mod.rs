@@ -107,6 +107,13 @@ impl ShortTermMemory {
         Some(entry)
     }
 
+    /// 删除指定 key
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        let tree = self.db.open_tree(b"entries")?;
+        tree.remove(key.as_bytes())?;
+        Ok(())
+    }
+
     pub async fn get_by_prefix(&self, prefix: &str) -> Vec<Entry> {
         let tree = match self.db.open_tree(b"entries") {
             Ok(t) => t,

@@ -240,6 +240,11 @@ impl OpenClawBridge {
         self.recall_with_agent(query, layer, None).await
     }
 
+    /// 删除记忆（aiboss 权限控制）
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.memory.delete(key).await
+    }
+
     /// 语义召回（搜指定 layer）
     pub async fn recall_semantic(&self, query: &str, layer: Option<Layer>) -> Vec<RecallResult> {
         self.recall_semantic_with_agent(query, layer, None).await
