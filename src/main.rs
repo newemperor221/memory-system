@@ -1,23 +1,153 @@
-//! MemorySystem v2 — CLI + HTTP API entry point
+//! Triple-Layer Memory System for Multi-Agent
+//!
+//! 用法：
+//!   cargo run -- serve --workspace /path/to/workspace
+//!   cargo run -- remember "这是一条测试记忆"
+//!   cargo run -- recall "测试"
+
+mod l0;
+mod l1;
+mod l2;
+mod l3;
+mod l4;
+mod common;
+mod openclaw;
 
 use anyhow::Result;
-use axum::{
-    extract::Query,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+pub use common::{Entry, Importance, Layer, RecallRequest, RecallResult, HotSegment, HotTier};
+use crate::common::encoding::percent_decode;
+pub use l0::WorkingMemory;
+pub use l1::ShortTermMemory;
+pub use l2::{EmbedBackend, LongTermMemory};
+pub use l4::VectorIndex;
+pub use openclaw::OpenClawBridge;
+
+/// 三层记忆系统
+pub struct MemorySystem {
+    l0: Arc<WorkingMemory>,
+    l1: Arc<ShortTermMemory>,
+    pub l2: Arc<LongTermMemory>,
+}
+
+impl MemorySystem {
+    pub async fn new() -> Result<Self> {
+        // 初始化 L4 向量索引（可选后端）
+        let l4_index = l4::create_l4_index().await?;
+
+        let l0 = Arc::new(WorkingMemory::new());
+        let l1 = Arc::new(ShortTermMemory::new().await?);
+        let l2 = Arc::new(LongTermMemory::new(l4_index).await?);
+        Ok(Self { l0, l1, l2 })
+    }
+
+    pub async fn remember(&self, mut entry: Entry) -> Result<()> {
+        if entry.id.is_empty() {
+            entry.id = uuid::Uuid::new_v4().to_string();
+        }
+        entry.created_at = chrono::Utc::now();
+        self.l0.write(entry.key.clone(), entry.clone()).await;
+        self.l1.write(entry.key.clone(), entry.clone()).await?;
+        self.l2.write(entry.key.clone(), entry.clone()).await;
+        Ok(())
+    }
+
+    /// 删除记忆（从所有层删除）
+    pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.l0.remove(key).await;
+        self.l1.delete(key).await?;
+        self.l2.delete(key).await?;
+        Ok(())
+    }
+
+    /// 合并两个 RecallResult 列表，按 entry.id 去重
+    fn merge_results(mut a: Vec<RecallResult>, mut b: Vec<RecallResult>) -> Vec<RecallResult> {
+        for item in b.drain(..) {
+            if !a.iter().any(|r| r.entry.id == item.entry.id) {
+                a.push(item);
+            }
+        }
+        a
+    }
+
+    /// 按 agent_id 过滤结果（key 前缀匹配）
+    fn filter_by_agent_id(results: Vec<RecallResult>, agent_id: Option<&str>) -> Vec<RecallResult> {
+        match agent_id {
+            Some(aid) => {
+                let prefix = format!("private:agent:{}:", aid);
+                results
+                    .into_iter()
+                    .filter(|r| r.entry.key.starts_with(&prefix))
+                    .collect()
+            }
+            None => results,
+        }
+    }
+
+    pub async fn recall(&self, req: RecallRequest) -> Vec<RecallResult> {
+        let agent_id = req.agent_id.as_deref();
+        // Bug fix: 同时搜索 L1 和 L2，再按 agent_id 过滤
+        let l2_results = self.l2.recall(&req, false).await;
+        let l1_results = self.l1.recall(&req).await;
+        let merged = Self::merge_results(l2_results, l1_results);
+        let sorted = {
+            let mut r = merged;
+            r.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            r
+        };
+        Self::filter_by_agent_id(sorted, agent_id)
+    }
+
+    pub async fn recall_with_semantic(&self, req: RecallRequest) -> Vec<RecallResult> {
+        let agent_id = req.agent_id.as_deref();
+        let l2_results = self.l2.recall(&req, true).await;
+        let l1_results = self.l1.recall(&req).await;
+        let merged = Self::merge_results(l2_results, l1_results);
+        let sorted = {
+            let mut r = merged;
+            r.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            r
+        };
+        Self::filter_by_agent_id(sorted, agent_id)
+    }
+
+    pub async fn recall_bm25(&self, query: &str, limit: usize) -> Vec<RecallResult> {
+        self.l2.recall_bm25(query, limit).await
+    }
+
+    pub async fn get(&self, key: &str) -> Option<Entry> {
+        if let Some(v) = self.l0.get(key) {
+            return Some(v);
+        }
+        self.l1.get(key).await
+    }
+
+    pub async fn gc(&self) -> Result<()> {
+        self.l1.gc().await?;
+        self.l2.gc().await?;
+        Ok(())
+    }
+
+    pub fn stats(&self) -> MemoryStats {
+        MemoryStats {
+            l0_entries: self.l0.len(),
+            l1_entries: self.l1.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    pub l0_entries: usize,
+    pub l1_entries: usize,
+}
+
+// ─── CLI Entry Point ──────────────────────────────────────────────────
+
 use clap::Parser;
 
-use std::sync::Arc;
-use tokio::net::TcpListener;
-
-use memory_system_v2::{
-    common::{Entry, Importance, Layer, RecallRequest},
-    Config, MemorySystem,
-};
-use axum_server::tls_rustls::RustlsConfig;
 #[derive(Parser)]
 struct Cli {
     #[clap(subcommand)]
@@ -26,338 +156,483 @@ struct Cli {
 
 #[derive(Parser)]
 enum Command {
-    /// Start HTTP API server
+    /// 启动 HTTP API 服务
     Serve {
-        #[clap(long, default_value = "127.0.0.1:7891")]
-        listen: String,
         #[clap(long, default_value = ".")]
-        workspace: String,
+        workspace: std::path::PathBuf,
+        #[clap(long, default_value = "127.0.0.1:7890")]
+        listen: String,
     },
-    /// Write a memory entry
+    /// 写入记忆
     Remember {
-        #[clap(long)]
-        key: String,
-        #[clap(long)]
-        value: String,
         #[clap(long, default_value = "normal")]
         importance: String,
-        #[clap(long, default_value = "private")]
-        layer: String,
-        #[clap(long)]
-        tags: Option<String>,
+        #[clap(last = true)]
+        text: String,
     },
-    /// Recall memories
+    /// 召回记忆（BM25）
     Recall {
         #[clap(long)]
-        query: String,
-        #[clap(long, default_value = "false")]
         semantic: bool,
-        #[clap(long, default_value = "10")]
-        limit: usize,
+        #[clap(last = true)]
+        query: String,
     },
-    /// Get system statistics
-    Stats,
-    /// Verify data integrity
-    Verify,
+    /// 查看状态
+    Status,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     let cli = Cli::parse();
 
     match cli.cmd {
-        Command::Serve { listen, workspace } => {
-            std::env::set_var("WORKSPACE", &workspace);
-
-            let config = Config::default();
-            let memory = Arc::new(MemorySystem::new(config).await?);
-
-            // Build Axum router
-            let app = Router::new()
-                .route("/health", get(health_handler))
-                .route("/stats", get(stats_handler))
-                .route("/recall", get(recall_handler))
-                .route("/remember", post(remember_handler))
-                .route("/get", get(get_handler))
-                .route("/delete", post(delete_handler))
-                .route("/metrics", get(metrics_handler))
-                .with_state(memory);
-
-            let listen_addr: std::net::SocketAddr = listen
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid listen address: {}", e))?;
-            let listener = TcpListener::bind(listen_addr).await?;
-            tracing::info!("MemorySystem API listening on http://{}", listen_addr);
-
-            axum::serve(listener, app).await?;
+        Command::Serve { workspace, listen } => {
+            let bridge = OpenClawBridge::new_async(workspace).await?;
+            bridge.load_workspace().await?;
+            bridge.start_background_sync();
+            let addr: std::net::SocketAddr = listen.parse()?;
+            tracing::info!("记忆系统监听 {}", addr);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            loop {
+                if let Ok((mut stream, _peer)) = listener.accept().await {
+                    let bridge = bridge.clone();
+                    tokio::spawn(async move {
+                        // 直接 await：handle_connection 是 async fn，直接调用即可
+                        // 注意：不再用 catch_unwind 包 block_on（会跟 Tokio 冲突）
+                        let result: anyhow::Result<()> = handle_connection(&mut stream, &bridge).await;
+                        match result {
+                            Ok(()) => { /* 正常 */ }
+                            Err(e) => tracing::warn!("请求处理失败: {}", e),
+                        }
+                    });
+                }
+            }
         }
-        Command::Remember {
-            key,
-            value,
-            importance,
-            layer,
-            tags,
-        } => {
-            let config = Config::default();
-            let memory = MemorySystem::new(config).await?;
-
-            let entry = Entry::new(
-                key,
-                value,
-                Importance::from(importance.as_str()),
-                tags.map(|s| s.split(',').map(String::from).collect())
-                    .unwrap_or_default(),
-                "cli".to_string(),
-                Layer::from(layer.as_str()),
-            );
-
-            memory.remember(entry).await?;
+        Command::Remember { text, importance } => {
+            let bridge = OpenClawBridge::new_async(".").await?;
+            let imp = match importance.as_str() {
+                "critical" => Importance::Critical,
+                "high" => Importance::High,
+                "low" => Importance::Low,
+                _ => Importance::Normal,
+            };
+            bridge.remember_text(text, imp, vec![], "cli", Layer::Private).await?;
             println!("✓ 记忆已保存");
         }
-        Command::Recall {
-            query,
-            semantic,
-            limit,
-        } => {
-            let config = Config::default();
-            let memory = MemorySystem::new(config).await?;
-
-            let req = RecallRequest {
-                query,
-                keys: None,
-                agent_id: None,
-                tags: None,
-                limit: Some(limit),
-                layer: None,
-                semantic,
+        Command::Recall { semantic, query } => {
+            let bridge = OpenClawBridge::new_async(".").await?;
+            let results = if semantic {
+                bridge.recall_semantic(&query, None).await
+            } else {
+                bridge.recall(&query, None).await
             };
-
-            let results = memory.recall(req).await;
             println!("找到 {} 条结果:", results.len());
             for r in results {
-                println!(
-                    "  [{}] {:.2} | {} | {}",
-                    r.from_layer, r.score, r.entry.key, r.entry.source
-                );
+                println!("  [{}] {:.2} | {}", r.from_layer, r.score, r.entry.key);
                 let preview = &r.entry.value[..r.entry.value.len().min(100)];
                 println!("    {}\n", preview);
             }
         }
-        Command::Stats => {
-            let config = Config::default();
-            let memory = MemorySystem::new(config).await?;
-            let stats = memory.stats();
+        Command::Status => {
+            let bridge = OpenClawBridge::new_async(".").await?;
+            let stats = bridge.stats();
             println!("L0: {} 条", stats.l0_entries);
             println!("L1: {} 条", stats.l1_entries);
-            println!("L2: {} 条 (向量: {}, pending: {})",
-                stats.l2_entries, stats.l2_vectors_cached, stats.l2_pending_vectors);
-            println!("L3: {} 个归档文件", stats.l3_archived_files);
-        }
-        Command::Verify => {
-            let config = Config::default();
-            let memory = MemorySystem::new(config).await?;
-            let stats = memory.stats();
-            println!("✓ L0: {}", stats.l0_entries);
-            println!("✓ L1: {}", stats.l1_entries);
-            println!("✓ L2: {}", stats.l2_entries);
-            println!("✓ L3: {}", stats.l3_archived_files);
         }
     }
 
     Ok(())
 }
 
-// ─── HTTP Handlers ────────────────────────────────────────────────────────────
+// ─── HTTP 请求处理 ──────────────────────────────────────────────────
 
-async fn health_handler(memory: axum::extract::State<Arc<MemorySystem>>) -> impl IntoResponse {
-    let stats = memory.stats();
-    if stats.layer_health.iter().any(|(_, s)| s.is_some()) {
-        let issues: Vec<_> = stats.layer_health.iter()
-            .filter_map(|(k, v)| v.as_ref().map(|vv| format!("{}: {}", k, vv)))
-            .collect();
-        (StatusCode::SERVICE_UNAVAILABLE, format!("DEGRADED: {}", issues.join(", ")))
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
+
+/// 单个请求超时（防止慢客户端占用连接）
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+/// 最大请求体大小（1MB，防止内存耗尽）
+const MAX_BODY_SIZE: usize = 1 * 1024 * 1024;
+
+/// 读取 HTTP 请求行和 headers，返回 (method, path?query, headers_map)
+async fn read_request_line(
+    stream: &mut tokio::net::TcpStream,
+) -> anyhow::Result<(String, String, std::collections::HashMap<String, String>)> {
+    let mut header_buf = Vec::with_capacity(4096);
+    let mut prev_was_crlf = false;
+
+    // 逐字节读取直到遇到空行 \r\n\r\n
+    loop {
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await?;
+        header_buf.push(byte[0]);
+
+        if header_buf.len() > MAX_BODY_SIZE + 8192 {
+            anyhow::bail!("HTTP headers 超出大小限制");
+        }
+
+        // 检测 \r\n\r\n 完整序列
+        if byte[0] == b'\n' && prev_was_crlf {
+            // 检查倒数第3、倒数第2个字节是不是 \r\n
+            if header_buf.len() >= 4 {
+                let last4 = [
+                    header_buf[header_buf.len() - 4],
+                    header_buf[header_buf.len() - 3],
+                    header_buf[header_buf.len() - 2],
+                    header_buf[header_buf.len() - 1],
+                ];
+                if last4 == [b'\r', b'\n', b'\r', b'\n'] {
+                    break; // 完整的 \r\n\r\n
+                }
+            }
+        }
+        prev_was_crlf = byte[0] == b'\r';
+    }
+
+    let header_str = String::from_utf8_lossy(&header_buf);
+    let mut lines = header_str.lines();
+
+    let first_line = lines.next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        anyhow::bail!("无效请求行");
+    }
+    let method = parts[0].to_string();
+    let path_with_query = parts[1].to_string();
+
+    // 解析 headers
+    let mut headers = std::collections::HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon_pos) = line.find(':') {
+            let key = line[..colon_pos].trim().to_lowercase();
+            let val = line[colon_pos + 1..].trim().to_string();
+            headers.insert(key, val);
+        }
+    }
+
+    Ok((method, path_with_query, headers))
+}
+
+async fn handle_connection(
+    stream: &mut tokio::net::TcpStream,
+    bridge: &OpenClawBridge,
+) -> anyhow::Result<()> {
+    // 读取请求行 + headers（带超时）
+    let (method, path_with_query, headers) = match timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        read_request_line(stream),
+    ).await {
+        Ok(r) => match r {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("请求解析失败: {}", e);
+                return Ok(());
+            }
+        },
+        Err(_) => {
+            tracing::warn!("请求读取超时");
+            return Ok(());
+        }
+    };
+
+    let path_parts: Vec<&str> = path_with_query.split('?').collect();
+    let path = path_parts[0];
+    let query_str = path_parts.get(1).unwrap_or(&"");
+
+    // 解析 query string（同时解码 percent-encoded）
+    let params: std::collections::HashMap<String, String> = query_str
+        .split('&')
+        .filter_map(|pair| {
+            let mut kv = pair.split('=');
+            let k = kv.next()?;
+            let v = kv.next().unwrap_or("");
+            Some((percent_decode(k), percent_decode(v)))
+        })
+        .collect();
+
+    // 从 headers 取 Content-Length
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_BODY_SIZE);
+
+    // API 密钥验证（生产模式：强制要求）
+    // - 设置了 MEMORY_API_KEY → 必须提供 X-API-Key header
+    // - 未设置 → 拒绝所有请求（防止意外裸奔）
+    let expected_key = match std::env::var("MEMORY_API_KEY") {
+        Ok(k) if !k.is_empty() => Some(k),
+        _ => None,
+    };
+
+    // GET /health 跳过认证（供负载均衡健康检查）
+    let is_health_check = method == "GET" && path == "/health";
+
+    if !is_health_check {
+        match expected_key {
+            Some(ref key) => {
+                let provided_key = headers.get("x-api-key").map(|s| s.as_str()).unwrap_or("");
+                if provided_key.is_empty() || provided_key != key {
+                    tracing::warn!("API 密钥验证失败 from {:?}", stream.peer_addr());
+                    let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).await?;
+                    return Ok(());
+                }
+            }
+            None => {
+                // 未配置 API key → 拒绝所有请求（生产环境不应裸奔）
+                tracing::error!("MEMORY_API_KEY 未配置，拒绝请求");
+                let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                stream.write_all(resp.as_bytes()).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    // 读取 body（POST 请求）
+    let body = if method == "POST" && content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), stream.read_exact(&mut buf)).await {
+            Ok(Ok(_n)) => {},
+            Ok(Err(e)) => {
+                tracing::warn!("POST body 读取失败: {}", e);
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::warn!("POST body 读取超时");
+                return Ok(());
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
     } else {
-        (StatusCode::OK, "OK".to_string())
-    }
-}
-
-async fn stats_handler(memory: axum::extract::State<Arc<MemorySystem>>) -> impl IntoResponse {
-    Json(memory.stats())
-}
-
-async fn recall_handler(
-    memory: axum::extract::State<Arc<MemorySystem>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let query = params.get("query").cloned().unwrap_or_default();
-    let semantic = params.get("semantic").map(|v| v == "true").unwrap_or(false);
-    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(10);
-
-    let req = RecallRequest {
-        query,
-        keys: None,
-        agent_id: params.get("agent_id").cloned(),
-        tags: params.get("tags").cloned().map(|s|
-            s.split(',').map(String::from).collect()
-        ),
-        limit: Some(limit),
-        layer: params.get("layer").as_ref().map(|s| Layer::from(s.as_str())),
-        semantic,
+        String::new()
     };
 
-    let results = memory.recall(req).await;
-    Json(serde_json::json!({
-        "ok": true,
-        "results": results,
-        "total": results.len(),
-    }))
-}
-
-async fn remember_handler(
-    memory: axum::extract::State<Arc<MemorySystem>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let key = match body.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k.to_string(),
-        None => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "ok": false,
-                "error": "missing_field",
-                "message": "key is required"
-            })))
-        }
-    };
-
-    let value = match body.get("value").and_then(|v| v.as_str()) {
-        Some(v) => v.to_string(),
-        None => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "ok": false,
-                "error": "missing_field",
-                "message": "value is required"
-            })))
-        }
-    };
-
-    let importance = body
-        .get("importance")
-        .and_then(|v| v.as_str())
-        .map(Importance::from)
-        .unwrap_or(Importance::Normal);
-
-    let layer = body
-        .get("layer")
-        .and_then(|v| v.as_str())
-        .map(Layer::from)
-        .unwrap_or(Layer::Private);
-
-    let tags = body
-        .get("tags")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-
-    let entry = Entry::new(
-        key,
-        value,
-        importance,
-        tags,
-        "http-api".to_string(),
-        layer,
-    );
-
-    match memory.remember(entry).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
-            "ok": true,
-            "indexed": false,
-            "note": "语义索引将在后台处理"
-        }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "ok": false,
-            "error": "write_failed",
-            "message": e.to_string()
-        }))),
-    }
-}
-
-async fn get_handler(
-    memory: axum::extract::State<Arc<MemorySystem>>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let key = match params.get("key") {
-        Some(k) => k,
-        None => {
-            let body = serde_json::json!({
-                "ok": false,
-                "error": "missing_param",
-                "param": "key"
+    let response = match (method.as_str(), path) {
+        // GET /recall?query=xxx&semantic=true&layer=public|private&agent_id=aicode
+        ("GET", "/recall") => {
+            let query = params.get("query").map(|s| s.as_str()).unwrap_or("");
+            let semantic = params.get("semantic").map_or(false, |v| v == "true");
+            let layer = params.get("layer").and_then(|v| match v.as_str() {
+                "public" => Some(Layer::Public),
+                "private" => Some(Layer::Private),
+                _ => None,
             });
-            return Err((StatusCode::BAD_REQUEST, axum::response::Json(body)));
+            // Bug fix: 解析 agent_id 参数并传递
+            let agent_id = params.get("agent_id").cloned();
+            let results = if semantic {
+                bridge.recall_semantic_with_agent(query, layer, agent_id.as_deref()).await
+            } else {
+                bridge.recall_with_agent(query, layer, agent_id.as_deref()).await
+            };
+            json_response(&results)
         }
+
+        // GET /get?key=xxx&agent_id=xxx
+        ("GET", "/get") => {
+            let key = match params.get("key").map(|s| s.as_str()) {
+                Some(k) => k,
+                None => {
+                    return Ok(());
+                }
+            };
+            let caller_agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("");
+            let entry = bridge.get(key).await;
+
+            // 权限校验：
+            // - public 记忆：任何人可读
+            // - private 记忆：仅创建者可读（或 aiboss 可读所有公共）
+            match entry {
+                Some(e) => {
+                    let is_public = e.layer == Layer::Public;
+                    let is_owner = e.source == caller_agent_id;
+                    let is_boss_reading_public = caller_agent_id == "aiboss" && is_public;
+
+                    if is_public || is_owner || is_boss_reading_public {
+                        json_response(&e)
+                    } else {
+                        json_response(&serde_json::json!({
+                            "error": "forbidden",
+                            "detail": "无权读取此记忆"
+                        }))
+                    }
+                }
+                None => {
+                    // key 不存在也返回 not_found（不暴露是否存在）
+                    json_response(&serde_json::json!({
+                        "error": "not_found",
+                        "key": key
+                    }))
+                }
+            }
+        }
+
+        // GET /stats
+        ("GET", "/stats") => {
+            let stats = bridge.stats();
+            json_response(&serde_json::json!({
+                "l0_entries": stats.l0_entries,
+                "l1_entries": stats.l1_entries,
+                "l2_entries": bridge.memory.l2.len()
+            }))
+        }
+
+        // GET /health
+        ("GET", "/health") => {
+            plain_response("OK")
+        }
+
+        // POST /remember
+        ("POST", "/remember") => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            #[allow(dead_code)]
+            struct RememberRequest {
+                value: String,
+                key: Option<String>,
+                importance: Option<String>,
+                tags: Option<Vec<String>>,
+                /// Agent ID（必填）
+                agent_id: String,
+                /// 层级：public 或 private（默认 private）
+                layer: Option<String>,
+            }
+            match serde_json::from_str::<RememberRequest>(&body) {
+                Ok(req) => {
+                    let imp = match req.importance.as_deref().unwrap_or("normal") {
+                        "critical" => Importance::Critical,
+                        "high" => Importance::High,
+                        "low" => Importance::Low,
+                        _ => Importance::Normal,
+                    };
+                    let layer = match req.layer.as_deref().unwrap_or("private") {
+                        "public" => Layer::Public,
+                        _ => Layer::Private,
+                    };
+                    // Reverted: all agents can write public memory
+                    // aiboss has delete permission for moderation
+                    bridge
+                        .remember_text(req.value, imp, req.tags.unwrap_or_default(), &req.agent_id, layer)
+                        .await?;
+                    json_response(&serde_json::json!({
+                        "ok": true,
+                        "layer": if layer == Layer::Public { "public" } else { "private" },
+                        "message": "记忆已保存"
+                    }))
+                }
+                Err(e) => json_response(&serde_json::json!({
+                    "error": "parse_error",
+                    "detail": e.to_string()
+                })),
+            }
+        }
+
+        // POST /gc
+        ("POST", "/gc") => {
+            if let Err(e) = bridge.memory.gc().await {
+                json_response(&serde_json::json!({
+                    "error": "gc_failed",
+                    "detail": e.to_string()
+                }))
+            } else {
+                json_response(&serde_json::json!({
+                    "ok": true,
+                    "message": "GC 完成"
+                }))
+            }
+        }
+
+        // DELETE /memory?key=xxx&agent_id=xxx
+        ("DELETE", "/memory") => {
+            let key = params.get("key").cloned();
+            let agent_id = params.get("agent_id").cloned();
+
+            if key.is_none() {
+                json_response(&serde_json::json!({
+                    "error": "missing_param",
+                    "param": "key"
+                }))
+            } else {
+                let key_str = key.as_ref().unwrap();
+
+                // 权限校验：读取 entry，检查权限
+                let entry = bridge.get(key_str).await;
+
+                // ① 未提供 agent_id → 拒绝
+                let Some(caller_id) = agent_id.as_deref() else {
+                    json_response(&serde_json::json!({
+                        "error": "forbidden",
+                        "detail": "必须提供 agent_id 参数"
+                    }));
+                    return Ok(());
+                };
+
+                // ② 找不到记录 → 无论是否存在都返回 404（不暴露是否存在）
+                let Some(entry) = entry else {
+                    json_response(&serde_json::json!({
+                        "error": "not_found",
+                        "key": key_str
+                    }));
+                    return Ok(());
+                };
+
+                // ③ 权限判断：本人创建 OR（aiboss 且是公共记忆）
+                let authorized = entry.source == caller_id
+                    || (caller_id == "aiboss" && entry.layer == Layer::Public);
+
+                if !authorized {
+                    json_response(&serde_json::json!({
+                        "error": "forbidden",
+                        "detail": "无权删除此记忆（只能删除自己创建的，或 aiboss 可删公共记忆）"
+                    }))
+                } else {
+                    match bridge.delete(key_str).await {
+                        Ok(_) => json_response(&serde_json::json!({
+                            "ok": true,
+                            "message": "记忆已删除"
+                        })),
+                        Err(e) => json_response(&serde_json::json!({
+                            "error": "delete_failed",
+                            "detail": e.to_string()
+                        })),
+                    }
+                }
+            }
+        }
+
+        _ => not_found(),
     };
 
-    match memory.get(key).await {
-        Some(entry) => {
-            let body = serde_json::json!({"ok": true, "entry": entry});
-            Ok((StatusCode::OK, axum::response::Json(body)))
-        }
-        None => {
-            let body = serde_json::json!({"ok": false, "error": "not_found", "key": key});
-            Ok((StatusCode::NOT_FOUND, axum::response::Json(body)))
-        }
-    }
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
 }
 
-async fn delete_handler(
-    memory: axum::extract::State<Arc<MemorySystem>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
-    let key = match body.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => {
-            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "ok": false,
-                "error": "missing_field",
-                "message": "key is required"
-            })))
-        }
-    };
-
-    match memory.delete(key).await {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({
-            "ok": true
-        }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "ok": false,
-            "error": "delete_failed",
-            "message": e.to_string()
-        }))),
-    }
+fn json_response<T: serde::Serialize>(data: &T) -> String {
+    let body = serde_json::to_string(data).unwrap_or_else(|_| r#"{"error":"serialize_error"}"#.to_string());
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+        body.len(),
+        body
+    )
 }
 
-async fn metrics_handler(memory: axum::extract::State<Arc<MemorySystem>>) -> impl IntoResponse {
-    let stats = memory.stats();
-    let body = format!(
-        r#"# HELP memory_entries_total Memory entries per layer
-# TYPE memory_entries_total gauge
-memory_l0_entries_total {}
-memory_l1_entries_total {}
-memory_l2_entries_total {}
-memory_l2_vectors_cached_total {}
-memory_l2_pending_vectors_total {}
-memory_l3_archived_files_total {}
-"#,
-        stats.l0_entries,
-        stats.l1_entries,
-        stats.l2_entries,
-        stats.l2_vectors_cached,
-        stats.l2_pending_vectors,
-        stats.l3_archived_files,
-    );
-    axum::response::Response::builder()
-        .header("Content-Type", "text/plain; version=0.0.4")
-        .body(axum::body::Body::from(body))
-        .unwrap()
+fn plain_response(text: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+        text.len(),
+        text
+    )
 }
+
+fn not_found() -> String {
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string()
+}
+
