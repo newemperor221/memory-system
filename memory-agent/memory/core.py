@@ -592,6 +592,23 @@ class MemorySystem:
         ))
 
         self._conn.commit()
+
+        # ── 同步：写一条 trust_shift 情感事件 ───────────────────────────
+        # 这样 build_character_state 下次调用时能自动把 trust_levels 同步到 character_states
+        if delta_trust != 0.0:
+            sync_event = EmotionEvent(
+                character=char_a,
+                chapter=chapter or "unknown",
+                event_type="trust_shift",
+                event_raw=f"关系变化同步：{char_b} trust {delta_trust:+.2f}",
+                emotion_vector={char_b: delta_trust},
+                intensity=abs(delta_trust),
+                decision_tendency=None,
+                related_fact_keys=[],
+            )
+            sync_event.save(self._conn)
+            self._conn.commit()
+
         return {"intimacy": intimacy, "trust": trust, "tension": tension}
 
     def get_relationship(self, char_a: str, char_b: str) -> dict:
